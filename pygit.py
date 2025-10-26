@@ -36,7 +36,8 @@ def init(repo):
     os.mkdir(os.path.join(repo, '.git'))
     for name in ['objects', 'refs', 'refs/heads']:
         os.mkdir(os.path.join(repo, '.git', name))
-    write_file(os.path.join(repo, '.git', 'HEAD'), b'ref: refs/heads/master')
+    write_file(os.path.join(repo, '.git', 'refs/heads/master'), b'')
+    set_head('refs/heads/master', git_dir=os.path.join(repo, '.git'))
     print('initialized empty repository: {}'.format(repo))
 
 
@@ -270,16 +271,38 @@ def write_tree():
     return hash_object(b''.join(tree_entries), 'tree')
 
 
-def get_head_ref():
-    """Return the reference pointed to by HEAD, or None if detached."""
+def resolve_head():
+    """Return tuple of (ref_path, sha1) for current HEAD reference."""
     head_path = os.path.join('.git', 'HEAD')
     try:
         head_contents = read_file(head_path).decode().strip()
     except FileNotFoundError:
-        return None
+        return (None, None)
     if head_contents.startswith('ref: '):
-        return head_contents[5:]
-    return None
+        ref_path = head_contents[5:]
+        try:
+            sha1 = read_file(os.path.join('.git', ref_path)).decode().strip()
+        except FileNotFoundError:
+            sha1 = None
+        if not sha1:
+            sha1 = None
+        return (ref_path, sha1)
+    return (None, head_contents or None)
+
+
+def update_ref(ref_path, sha1):
+    """Update the given ref path to point to the specified SHA-1."""
+    path = os.path.join('.git', ref_path)
+    dir_name = os.path.dirname(path)
+    if dir_name and not os.path.exists(dir_name):
+        os.makedirs(dir_name, exist_ok=True)
+    write_file(path, (sha1 + '\n').encode())
+
+
+def set_head(ref_path, git_dir='.git'):
+    """Point HEAD at the given ref path."""
+    write_file(os.path.join(git_dir, 'HEAD'),
+               ('ref: {}\n'.format(ref_path)).encode())
 
 
 def get_ref(ref_path):
@@ -290,16 +313,8 @@ def get_ref(ref_path):
 
 def get_local_master_hash():
     """Get current commit hash (SHA-1 string) of current HEAD ref."""
-    ref_path = get_head_ref()
-    if ref_path is None:
-        try:
-            return read_file(os.path.join('.git', 'HEAD')).decode().strip()
-        except FileNotFoundError:
-            return None
-    try:
-        return get_ref(ref_path)
-    except FileNotFoundError:
-        return None
+    _, sha1 = resolve_head()
+    return sha1
 
 
 def commit(message, author=None):
@@ -328,9 +343,13 @@ def commit(message, author=None):
     lines.append('')
     data = '\n'.join(lines).encode()
     sha1 = hash_object(data, 'commit')
-    ref_path = get_head_ref() or 'refs/heads/master'
-    write_file(os.path.join('.git', ref_path), (sha1 + '\n').encode())
-    print('committed to master: {:7}'.format(sha1))
+    ref_path, _ = resolve_head()
+    if ref_path:
+        update_ref(ref_path, sha1)
+    else:
+        update_ref('HEAD', sha1)
+    target = ref_path or 'HEAD'
+    print('committed to {}: {:7}'.format(target, sha1))
     return sha1
 
 
@@ -358,18 +377,7 @@ def iterate_commits(start_sha1):
 
 def log():
     """Print commit log starting from current HEAD."""
-    ref_path = get_head_ref()
-    head_sha1 = None
-    if ref_path:
-        try:
-            head_sha1 = get_ref(ref_path)
-        except FileNotFoundError:
-            head_sha1 = None
-    else:
-        try:
-            head_sha1 = read_file(os.path.join('.git', 'HEAD')).decode().strip()
-        except FileNotFoundError:
-            head_sha1 = None
+    _, head_sha1 = resolve_head()
     if not head_sha1:
         print('no commits yet')
         return
