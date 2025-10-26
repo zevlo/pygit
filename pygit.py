@@ -270,11 +270,34 @@ def write_tree():
     return hash_object(b''.join(tree_entries), 'tree')
 
 
-def get_local_master_hash():
-    """Get current commit hash (SHA-1 string) of local master branch."""
-    master_path = os.path.join('.git', 'refs', 'heads', 'master')
+def get_head_ref():
+    """Return the reference pointed to by HEAD, or None if detached."""
+    head_path = os.path.join('.git', 'HEAD')
     try:
-        return read_file(master_path).decode().strip()
+        head_contents = read_file(head_path).decode().strip()
+    except FileNotFoundError:
+        return None
+    if head_contents.startswith('ref: '):
+        return head_contents[5:]
+    return None
+
+
+def get_ref(ref_path):
+    """Return the SHA-1 string stored at the given ref path."""
+    path = os.path.join('.git', ref_path)
+    return read_file(path).decode().strip()
+
+
+def get_local_master_hash():
+    """Get current commit hash (SHA-1 string) of current HEAD ref."""
+    ref_path = get_head_ref()
+    if ref_path is None:
+        try:
+            return read_file(os.path.join('.git', 'HEAD')).decode().strip()
+        except FileNotFoundError:
+            return None
+    try:
+        return get_ref(ref_path)
     except FileNotFoundError:
         return None
 
@@ -305,10 +328,82 @@ def commit(message, author=None):
     lines.append('')
     data = '\n'.join(lines).encode()
     sha1 = hash_object(data, 'commit')
-    master_path = os.path.join('.git', 'refs', 'heads', 'master')
-    write_file(master_path, (sha1 + '\n').encode())
+    ref_path = get_head_ref() or 'refs/heads/master'
+    write_file(os.path.join('.git', ref_path), (sha1 + '\n').encode())
     print('committed to master: {:7}'.format(sha1))
     return sha1
+
+
+def iterate_commits(start_sha1):
+    """Yield commit metadata and parent hash for commits starting at SHA-1."""
+    current = start_sha1
+    while current:
+        obj_type, data = read_object(current)
+        if obj_type != 'commit':
+            raise ValueError('expected commit object, got {}'.format(obj_type))
+        text = data.decode()
+        header, _, message = text.partition('\n\n')
+        metadata = {}
+        parent = None
+        for line in header.splitlines():
+            key, value = line.split(' ', 1)
+            if key == 'parent':
+                parent = value
+            else:
+                metadata[key] = value
+        metadata['message'] = message.rstrip('\n')
+        yield current, metadata, parent
+        current = parent
+
+
+def log():
+    """Print commit log starting from current HEAD."""
+    ref_path = get_head_ref()
+    head_sha1 = None
+    if ref_path:
+        try:
+            head_sha1 = get_ref(ref_path)
+        except FileNotFoundError:
+            head_sha1 = None
+    else:
+        try:
+            head_sha1 = read_file(os.path.join('.git', 'HEAD')).decode().strip()
+        except FileNotFoundError:
+            head_sha1 = None
+    if not head_sha1:
+        print('no commits yet')
+        return
+
+    for sha1, metadata, _ in iterate_commits(head_sha1):
+        author_line = metadata.get('author', '')
+        author_name = author_line
+        date_str = ''
+        if author_line:
+            parts = author_line.rsplit(' ', 2)
+            if len(parts) == 3:
+                author_name = parts[0]
+                timestamp_str, tz = parts[1], parts[2]
+                try:
+                    timestamp = int(timestamp_str)
+                    formatted = time.strftime(
+                            '%Y-%m-%d %H:%M:%S', time.localtime(timestamp))
+                    date_str = '{} {}'.format(formatted, tz)
+                except ValueError:
+                    date_str = '{} {}'.format(timestamp_str, tz)
+            else:
+                author_name = author_line
+
+        message = metadata.get('message', '')
+
+        print('commit {}'.format(sha1))
+        if author_name:
+            print('Author: {}'.format(author_name))
+        if date_str:
+            print('Date:   {}'.format(date_str))
+        print()
+        for line in message.splitlines():
+            print('    ' + line)
+        print()
 
 
 def extract_lines(data):
@@ -536,6 +631,9 @@ if __name__ == '__main__':
     sub_parser.add_argument('repo',
             help='directory name for new repo')
 
+    sub_parser = sub_parsers.add_parser('log',
+            help='show commit log')
+
     sub_parser = sub_parsers.add_parser('ls-files',
             help='list files in index')
     sub_parser.add_argument('-s', '--stage', action='store_true',
@@ -574,6 +672,8 @@ if __name__ == '__main__':
         print(sha1)
     elif args.command == 'init':
         init(args.repo)
+    elif args.command == 'log':
+        log()
     elif args.command == 'ls-files':
         ls_files(details=args.stage)
     elif args.command == 'push':
