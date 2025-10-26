@@ -305,6 +305,21 @@ def set_head(ref_path, git_dir='.git'):
                ('ref: {}\n'.format(ref_path)).encode())
 
 
+def create_branch(name, start_sha1=None):
+    """Create a new branch ref pointing at the given (or current HEAD) SHA-1."""
+    if start_sha1 is None:
+        _, start_sha1 = resolve_head()
+        if not start_sha1:
+            raise ValueError('cannot determine start commit for new branch')
+
+    ref_path = os.path.join('refs', 'heads', name)
+    full_path = os.path.join('.git', ref_path)
+    if os.path.exists(full_path):
+        raise ValueError('branch {!r} already exists'.format(name))
+
+    update_ref(ref_path, start_sha1)
+
+
 def get_ref(ref_path):
     """Return the SHA-1 string stored at the given ref path."""
     path = os.path.join('.git', ref_path)
@@ -601,6 +616,13 @@ if __name__ == '__main__':
     sub_parser.add_argument('paths', nargs='+', metavar='path',
             help='path(s) of files to add')
 
+    sub_parser = sub_parsers.add_parser('branch',
+            help='create a new branch pointing at a commit (defaults to HEAD)')
+    sub_parser.add_argument('name', help='name of branch to create')
+    sub_parser.add_argument('--start', dest='start', metavar='sha1',
+            help='SHA-1 of commit where the new branch should start (defaults '
+                 'to current HEAD)')
+
     sub_parser = sub_parsers.add_parser('cat-file',
             help='display contents of object')
     valid_modes = ['commit', 'tree', 'blob', 'size', 'type', 'pretty']
@@ -665,6 +687,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.command == 'add':
         add(args.paths)
+    elif args.command == 'branch':
+        try:
+            create_branch(args.name, start_sha1=args.start)
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            sys.exit(1)
     elif args.command == 'cat-file':
         try:
             cat_file(args.mode, args.hash_prefix)
