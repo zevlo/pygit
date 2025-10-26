@@ -30,6 +30,14 @@ def write_file(path, data):
         f.write(data)
 
 
+def ensure_clean_working_tree():
+    """Raise ValueError if working tree or index have pending changes."""
+    changed, new, deleted = get_status()
+    if changed or new or deleted:
+        raise ValueError(
+                'working tree has unstaged changes; please commit or stash them first')
+
+
 def init(repo):
     """Create directory for repo and initialize .git directory."""
     os.mkdir(repo)
@@ -320,41 +328,17 @@ def create_branch(name, start_sha1=None):
     update_ref(ref_path, start_sha1)
 
 
-def checkout(branch_name):
-    """Check out the given branch by updating HEAD, index, and working tree."""
-    ref_path = os.path.join('refs', 'heads', branch_name)
-    full_ref_path = os.path.join('.git', ref_path)
-    if not os.path.exists(full_ref_path):
-        raise ValueError('branch {!r} does not exist'.format(branch_name))
-
-    changed, new, deleted = get_status()
-    if changed or new or deleted:
-        raise ValueError('working tree has unstaged changes; please commit or stash them before checkout')
-
-    commit_sha1 = read_file(full_ref_path).decode().strip()
-    if not commit_sha1:
-        raise ValueError('branch {!r} has no commits'.format(branch_name))
-
-    obj_type, commit_data = read_object(commit_sha1)
-    if obj_type != 'commit':
-        raise ValueError('expected commit object, got {}'.format(obj_type))
-
-    tree_sha1 = None
-    for line in commit_data.decode().splitlines():
-        if line.startswith('tree '):
-            parts = line.split()
-            if len(parts) >= 2:
-                tree_sha1 = parts[1]
-            break
-    if tree_sha1 is None:
-        raise ValueError('commit {} does not have a tree'.format(commit_sha1))
-
+def checkout_tree(tree_sha1):
+    """Replace working tree and index with the contents of tree."""
     for name in os.listdir('.'):
         if name == '.git':
             continue
         full_path = os.path.join('.', name)
         if os.path.islink(full_path) or not os.path.isdir(full_path):
-            os.remove(full_path)
+            try:
+                os.remove(full_path)
+            except FileNotFoundError:
+                pass
         else:
             shutil.rmtree(full_path)
 
@@ -384,6 +368,38 @@ def checkout(branch_name):
     entries.sort(key=operator.attrgetter('path'))
     write_index(entries)
 
+
+def checkout(branch_name):
+    """Check out the given branch by updating HEAD, index, and working tree."""
+    ref_path = os.path.join('refs', 'heads', branch_name)
+    full_ref_path = os.path.join('.git', ref_path)
+    if not os.path.exists(full_ref_path):
+        raise ValueError('branch {!r} does not exist'.format(branch_name))
+
+    changed, new, deleted = get_status()
+    if changed or new or deleted:
+        raise ValueError('working tree has unstaged changes; please commit or stash them before checkout')
+
+    commit_sha1 = read_file(full_ref_path).decode().strip()
+    if not commit_sha1:
+        raise ValueError('branch {!r} has no commits'.format(branch_name))
+
+    obj_type, commit_data = read_object(commit_sha1)
+    if obj_type != 'commit':
+        raise ValueError('expected commit object, got {}'.format(obj_type))
+
+    tree_sha1 = None
+    for line in commit_data.decode().splitlines():
+        if line.startswith('tree '):
+            parts = line.split()
+            if len(parts) >= 2:
+                tree_sha1 = parts[1]
+            break
+    if tree_sha1 is None:
+        raise ValueError('commit {} does not have a tree'.format(commit_sha1))
+
+    checkout_tree(tree_sha1)
+
     set_head(ref_path)
     print('Switched to branch {}'.format(branch_name))
 
@@ -400,12 +416,77 @@ def get_local_master_hash():
     return sha1
 
 
-def commit(message, author=None):
-    """Commit the current state of the index to master with given message.
-    Return hash of commit object.
-    """
-    tree = write_tree()
-    parent = get_local_master_hash()
+def read_commit(sha1):
+    """Return tuple of (tree_sha1, parent_list, metadata, message) for commit."""
+    obj_type, data = read_object(sha1)
+    if obj_type != 'commit':
+        raise ValueError('expected commit object, got {}'.format(obj_type))
+
+    text = data.decode()
+    header, _, message = text.partition('\n\n')
+    metadata = {}
+    parents = []
+    tree = None
+    for line in header.splitlines():
+        key, value = line.split(' ', 1)
+        if key == 'parent':
+            parents.append(value)
+        elif key == 'tree':
+            tree = value
+        else:
+            metadata[key] = value
+    return tree, parents, metadata, message.rstrip('\n')
+
+
+def get_commit_tree(sha1):
+    """Return tree SHA-1 for the given commit SHA-1."""
+    if sha1 is None:
+        return None
+    tree, _, _, _ = read_commit(sha1)
+    if tree is None:
+        raise ValueError('commit {} does not have a tree'.format(sha1))
+    return tree
+
+
+def find_merge_base(left_sha1, right_sha1):
+    """Find merge base SHA-1 between the two commits."""
+    if left_sha1 is None or right_sha1 is None:
+        return left_sha1 or right_sha1
+
+    ancestors = {}
+    queue = [(left_sha1, 0)]
+    while queue:
+        sha1, depth = queue.pop()
+        if sha1 in ancestors and depth >= ancestors[sha1]:
+            continue
+        ancestors[sha1] = depth
+        _, parents, _, _ = read_commit(sha1)
+        for parent in parents:
+            queue.append((parent, depth + 1))
+
+    queue = collections.deque([(right_sha1, 0)])
+    best = None
+    best_score = None
+    seen = set()
+    while queue:
+        sha1, depth = queue.popleft()
+        if sha1 in seen:
+            continue
+        seen.add(sha1)
+        if sha1 in ancestors:
+            score = depth + ancestors[sha1]
+            if best is None or score < best_score:
+                best = sha1
+                best_score = score
+            continue
+        _, parents, _, _ = read_commit(sha1)
+        for parent in parents:
+            queue.append((parent, depth + 1))
+    return best
+
+
+def create_commit(tree_sha1, parents, message, author=None):
+    """Create commit object with given tree, parents, and message."""
     if author is None:
         author = '{} <{}>'.format(
                 os.environ['GIT_AUTHOR_NAME'], os.environ['GIT_AUTHOR_EMAIL'])
@@ -416,8 +497,8 @@ def commit(message, author=None):
             '+' if utc_offset > 0 else '-',
             abs(utc_offset) // 3600,
             (abs(utc_offset) // 60) % 60)
-    lines = ['tree ' + tree]
-    if parent:
+    lines = ['tree ' + tree_sha1]
+    for parent in parents:
         lines.append('parent ' + parent)
     lines.append('author {} {}'.format(author, author_time))
     lines.append('committer {} {}'.format(author, author_time))
@@ -426,6 +507,16 @@ def commit(message, author=None):
     lines.append('')
     data = '\n'.join(lines).encode()
     sha1 = hash_object(data, 'commit')
+    return sha1
+
+
+def commit(message, author=None):
+    """Commit the current state of the index to master with given message.
+    Return hash of commit object.
+    """
+    tree = write_tree()
+    parent = get_local_master_hash()
+    sha1 = create_commit(tree, [parent] if parent else [], message, author=author)
     ref_path, _ = resolve_head()
     if ref_path:
         update_ref(ref_path, sha1)
@@ -594,6 +685,269 @@ def read_tree_files(tree_sha1, prefix=""):
     return files
 
 
+def tree_to_dict(tree_sha1):
+    """Return mapping of path -> (mode, sha1) for files in tree."""
+    if tree_sha1 is None:
+        return {}
+    return {path: (mode, sha1) for mode, path, sha1 in read_tree_files(tree_sha1)}
+
+
+def read_blob(sha1):
+    """Return blob data bytes for given SHA-1 or None if SHA-1 is None."""
+    if sha1 is None:
+        return None
+    obj_type, data = read_object(sha1)
+    if obj_type != 'blob':
+        raise ValueError('expected blob object, got {}'.format(obj_type))
+    return data
+
+
+def blob_to_lines(data):
+    """Convert blob bytes to list of text lines and trailing newline flag."""
+    if data is None:
+        return None, False
+    text = data.decode('utf-8', errors='surrogateescape')
+    return text.splitlines(), text.endswith('\n')
+
+
+def build_change_list(base_lines, new_lines):
+    """Return list of change dicts describing transformation from base."""
+    matcher = difflib.SequenceMatcher(None, base_lines, new_lines)
+    changes = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+        changes.append({'start': i1, 'end': i2, 'lines': new_lines[j1:j2]})
+    return changes
+
+
+def build_conflict_lines(current_lines, target_lines, current_label, target_label):
+    """Return list of lines containing merge conflict markers."""
+    lines = ['<<<<<<< ' + current_label]
+    lines.extend(current_lines)
+    lines.append('=======')
+    lines.extend(target_lines)
+    lines.append('>>>>>>> ' + target_label)
+    return lines
+
+
+def merge_lines(base_lines, current_lines, target_lines,
+                current_label, target_label):
+    """Perform a 3-way merge of the given line sets."""
+    if current_lines == target_lines:
+        return current_lines, False
+    if base_lines == current_lines:
+        return target_lines, False
+    if base_lines == target_lines:
+        return current_lines, False
+
+    cur_changes = build_change_list(base_lines, current_lines)
+    tgt_changes = build_change_list(base_lines, target_lines)
+    result = []
+    ci = 0
+    ti = 0
+    pos = 0
+    conflict = False
+
+    def get_change(changes, index):
+        return changes[index] if index < len(changes) else None
+
+    def collect_inserts(changes, index, pos):
+        collected = []
+        while index < len(changes):
+            change = changes[index]
+            if change['start'] == pos and change['start'] == change['end']:
+                collected.append(change['lines'])
+                index += 1
+            else:
+                break
+        return collected, index
+
+    while pos < len(base_lines):
+        cur_change = get_change(cur_changes, ci)
+        tgt_change = get_change(tgt_changes, ti)
+
+        cur_inserts, ci = collect_inserts(cur_changes, ci, pos)
+        tgt_inserts, ti = collect_inserts(tgt_changes, ti, pos)
+        if cur_inserts or tgt_inserts:
+            cur_lines = [line for block in cur_inserts for line in block]
+            tgt_lines = [line for block in tgt_inserts for line in block]
+            if cur_lines and tgt_lines:
+                if cur_lines == tgt_lines:
+                    result.extend(cur_lines)
+                else:
+                    conflict = True
+                    result.extend(build_conflict_lines(
+                            cur_lines, tgt_lines, current_label, target_label))
+            elif cur_lines:
+                result.extend(cur_lines)
+            elif tgt_lines:
+                result.extend(tgt_lines)
+
+        cur_change = get_change(cur_changes, ci)
+        tgt_change = get_change(tgt_changes, ti)
+
+        cur_block = (cur_change if cur_change and cur_change['start'] == pos
+                     and cur_change['end'] > pos else None)
+        tgt_block = (tgt_change if tgt_change and tgt_change['start'] == pos
+                     and tgt_change['end'] > pos else None)
+
+        if cur_block or tgt_block:
+            if cur_block and tgt_block:
+                cur_lines = cur_block['lines']
+                tgt_lines = tgt_block['lines']
+                if cur_lines == tgt_lines:
+                    result.extend(cur_lines)
+                else:
+                    conflict = True
+                    result.extend(build_conflict_lines(
+                            cur_lines, tgt_lines, current_label, target_label))
+                pos = max(cur_block['end'], tgt_block['end'])
+                ci += 1
+                ti += 1
+            elif cur_block:
+                result.extend(cur_block['lines'])
+                pos = cur_block['end']
+                ci += 1
+            else:
+                result.extend(tgt_block['lines'])
+                pos = tgt_block['end']
+                ti += 1
+        else:
+            result.append(base_lines[pos])
+            pos += 1
+
+    cur_change = get_change(cur_changes, ci)
+    tgt_change = get_change(tgt_changes, ti)
+    cur_inserts, ci = collect_inserts(cur_changes, ci, len(base_lines))
+    tgt_inserts, ti = collect_inserts(tgt_changes, ti, len(base_lines))
+    cur_lines = [line for block in cur_inserts for line in block]
+    tgt_lines = [line for block in tgt_inserts for line in block]
+    if cur_lines and tgt_lines:
+        if cur_lines == tgt_lines:
+            result.extend(cur_lines)
+        else:
+            conflict = True
+            result.extend(build_conflict_lines(
+                    cur_lines, tgt_lines, current_label, target_label))
+    elif cur_lines:
+        result.extend(cur_lines)
+    elif tgt_lines:
+        result.extend(tgt_lines)
+
+    return result, conflict
+
+
+def merge_trees(current_tree_sha1, target_tree_sha1, base_tree_sha1, target_label):
+    """Merge current and target trees using base tree as ancestor."""
+    base_files = tree_to_dict(base_tree_sha1)
+    current_files = tree_to_dict(current_tree_sha1)
+    target_files = tree_to_dict(target_tree_sha1)
+    all_paths = sorted(set(base_files) | set(current_files) | set(target_files))
+
+    results = {}
+    conflicts = []
+    for path in all_paths:
+        base_entry = base_files.get(path)
+        current_entry = current_files.get(path)
+        target_entry = target_files.get(path)
+
+        base_data = read_blob(base_entry[1]) if base_entry else None
+        current_data = read_blob(current_entry[1]) if current_entry else None
+        target_data = read_blob(target_entry[1]) if target_entry else None
+
+        base_lines, base_nl = blob_to_lines(base_data)
+        current_lines, current_nl = blob_to_lines(current_data)
+        target_lines, target_nl = blob_to_lines(target_data)
+
+        final_data = None
+        conflict = False
+
+        if current_data == target_data:
+            final_data = current_data
+        elif base_data == current_data:
+            final_data = target_data
+        elif base_data == target_data:
+            final_data = current_data
+        elif target_data is None and current_data is None:
+            final_data = None
+        elif target_data is None:
+            if base_data is None:
+                final_data = current_data
+            else:
+                conflict = True
+        elif current_data is None:
+            if base_data is None:
+                final_data = target_data
+            else:
+                conflict = True
+        else:
+            merged_lines, merge_conflict = merge_lines(
+                    base_lines or [], current_lines or [], target_lines or [],
+                    'HEAD', target_label)
+            conflict = merge_conflict
+            if not conflict:
+                newline = current_nl or target_nl or base_nl
+                text = '\n'.join(merged_lines)
+                if newline:
+                    text += '\n'
+                final_data = text.encode('utf-8', errors='surrogateescape')
+            else:
+                conflict_lines = merged_lines
+                text = '\n'.join(conflict_lines) + '\n'
+                final_data = text.encode('utf-8', errors='surrogateescape')
+
+        if conflict:
+            conflicts.append(path)
+            if final_data is None:
+                text = '\n'.join(build_conflict_lines(
+                        current_lines or [], target_lines or [], 'HEAD', target_label)) + '\n'
+                final_data = text.encode('utf-8', errors='surrogateescape')
+
+        if final_data is None:
+            results[path] = {'mode': None, 'data': None, 'conflict': conflict}
+        else:
+            if conflict and current_data is None and target_data is None:
+                mode = base_entry[0] if base_entry else 0o100644
+            else:
+                mode = None
+                for entry in (current_entry, target_entry, base_entry):
+                    if entry is not None:
+                        mode = entry[0]
+                        break
+                if mode is None:
+                    mode = 0o100644
+            results[path] = {'mode': mode, 'data': final_data, 'conflict': conflict}
+
+    return results, conflicts
+
+
+def apply_merge_results(results):
+    """Write merge results to working tree (including deletions)."""
+    for path in sorted(results):
+        info = results[path]
+        fs_path = path.replace('/', os.sep)
+        if info['data'] is None:
+            try:
+                os.remove(fs_path)
+            except FileNotFoundError:
+                pass
+            dir_name = os.path.dirname(fs_path)
+            while dir_name:
+                try:
+                    os.rmdir(dir_name)
+                except OSError:
+                    break
+                dir_name = os.path.dirname(dir_name)
+        else:
+            dir_name = os.path.dirname(fs_path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+            write_file(fs_path, info['data'])
+            if info.get('mode') is not None:
+                os.chmod(fs_path, stat.S_IMODE(info['mode']))
+
+
 def find_tree_objects(tree_sha1):
     """Return set of SHA-1 hashes of all objects in this tree (recursively),
     including the hash of the tree itself.
@@ -691,6 +1045,67 @@ def push(git_url, username=None, password=None):
     return (remote_sha1, missing)
 
 
+def merge(branch_name):
+    """Merge the given branch into the current HEAD."""
+    head_ref, current_sha1 = resolve_head()
+    if head_ref is None:
+        raise ValueError('cannot merge in detached HEAD state')
+
+    target_ref = os.path.join('refs', 'heads', branch_name)
+    full_target = os.path.join('.git', target_ref)
+    if not os.path.exists(full_target):
+        raise ValueError('branch {!r} does not exist'.format(branch_name))
+
+    target_sha1 = read_file(full_target).decode().strip()
+    if not target_sha1:
+        raise ValueError('branch {!r} has no commits'.format(branch_name))
+
+    ensure_clean_working_tree()
+
+    if current_sha1 == target_sha1:
+        print('Already up to date.')
+        return
+
+    base_sha1 = find_merge_base(current_sha1, target_sha1)
+    if current_sha1 is None or base_sha1 == current_sha1:
+        tree_sha1 = get_commit_tree(target_sha1)
+        checkout_tree(tree_sha1)
+        update_ref(head_ref, target_sha1)
+        print('Fast-forward merge to {}.'.format(branch_name))
+        return
+
+    if base_sha1 == target_sha1:
+        print('Already up to date.')
+        return
+
+    base_tree_sha1 = get_commit_tree(base_sha1) if base_sha1 else None
+    current_tree_sha1 = get_commit_tree(current_sha1)
+    target_tree_sha1 = get_commit_tree(target_sha1)
+
+    results, conflicts = merge_trees(current_tree_sha1, target_tree_sha1,
+            base_tree_sha1, branch_name)
+    apply_merge_results(results)
+
+    if conflicts:
+        print('Merge conflict{} in:'.format('s' if len(conflicts) != 1 else ''))
+        for path in conflicts:
+            print('   ', path)
+        print('Fix conflicts and commit the result.')
+        return
+
+    merged_paths = [path for path, info in results.items() if info['data'] is not None]
+    if merged_paths:
+        add(merged_paths)
+    else:
+        write_index([])
+
+    tree_sha1 = write_tree()
+    merge_message = 'Merge branch {}'.format(branch_name)
+    merge_sha1 = create_commit(tree_sha1, [current_sha1, target_sha1], merge_message)
+    update_ref(head_ref, merge_sha1)
+    print('Merge made commit {}.'.format(merge_sha1))
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     sub_parsers = parser.add_subparsers(dest='command', metavar='command')
@@ -770,6 +1185,10 @@ if __name__ == '__main__':
             help='username to use for authentication (uses GIT_USERNAME '
                  'environment variable by default)')
 
+    sub_parser = sub_parsers.add_parser('merge',
+            help='merge given branch into current branch')
+    sub_parser.add_argument('branch', help='name of branch to merge')
+
     sub_parser = sub_parsers.add_parser('status',
             help='show status of working copy')
 
@@ -809,6 +1228,12 @@ if __name__ == '__main__':
         ls_files(details=args.stage)
     elif args.command == 'push':
         push(args.git_url, username=args.username, password=args.password)
+    elif args.command == 'merge':
+        try:
+            merge(args.branch)
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            sys.exit(1)
     elif args.command == 'status':
         status()
     else:
