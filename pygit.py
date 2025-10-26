@@ -1,4 +1,4 @@
-import argparse, collections, difflib, enum, hashlib, operator, os, stat
+import argparse, collections, difflib, enum, hashlib, operator, os, shutil, stat
 import struct, sys, time, urllib.request, zlib
 
 
@@ -320,6 +320,74 @@ def create_branch(name, start_sha1=None):
     update_ref(ref_path, start_sha1)
 
 
+def checkout(branch_name):
+    """Check out the given branch by updating HEAD, index, and working tree."""
+    ref_path = os.path.join('refs', 'heads', branch_name)
+    full_ref_path = os.path.join('.git', ref_path)
+    if not os.path.exists(full_ref_path):
+        raise ValueError('branch {!r} does not exist'.format(branch_name))
+
+    changed, new, deleted = get_status()
+    if changed or new or deleted:
+        raise ValueError('working tree has unstaged changes; please commit or stash them before checkout')
+
+    commit_sha1 = read_file(full_ref_path).decode().strip()
+    if not commit_sha1:
+        raise ValueError('branch {!r} has no commits'.format(branch_name))
+
+    obj_type, commit_data = read_object(commit_sha1)
+    if obj_type != 'commit':
+        raise ValueError('expected commit object, got {}'.format(obj_type))
+
+    tree_sha1 = None
+    for line in commit_data.decode().splitlines():
+        if line.startswith('tree '):
+            parts = line.split()
+            if len(parts) >= 2:
+                tree_sha1 = parts[1]
+            break
+    if tree_sha1 is None:
+        raise ValueError('commit {} does not have a tree'.format(commit_sha1))
+
+    for name in os.listdir('.'):
+        if name == '.git':
+            continue
+        full_path = os.path.join('.', name)
+        if os.path.islink(full_path) or not os.path.isdir(full_path):
+            os.remove(full_path)
+        else:
+            shutil.rmtree(full_path)
+
+    files = read_tree_files(tree_sha1)
+    entries = []
+    for mode, path, sha1 in files:
+        if not stat.S_ISREG(mode):
+            raise ValueError('cannot checkout non-regular file {!r}'.format(path))
+        fs_path = path.replace('/', os.sep)
+        dir_name = os.path.dirname(fs_path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        obj_type, data = read_object(sha1)
+        if obj_type != 'blob':
+            raise ValueError('expected blob object for {!r}, got {}'.format(path, obj_type))
+        write_file(fs_path, data)
+        os.chmod(fs_path, stat.S_IMODE(mode))
+        st = os.stat(fs_path)
+        flags = len(path.encode())
+        assert flags < (1 << 12)
+        entry = IndexEntry(
+                int(st.st_ctime), 0, int(st.st_mtime), 0, st.st_dev,
+                st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_size,
+                bytes.fromhex(sha1), flags, path)
+        entries.append(entry)
+
+    entries.sort(key=operator.attrgetter('path'))
+    write_index(entries)
+
+    set_head(ref_path)
+    print('Switched to branch {}'.format(branch_name))
+
+
 def get_ref(ref_path):
     """Return the SHA-1 string stored at the given ref path."""
     path = os.path.join('.git', ref_path)
@@ -509,6 +577,23 @@ def read_tree(sha1=None, data=None):
     return entries
 
 
+def read_tree_files(tree_sha1, prefix=""):
+    """Return list of blob entries from tree (recursively).
+
+    The result is a list of (mode, path, sha1) tuples where each tuple
+    represents a blob entry and the path is relative to the repository root.
+    """
+    files = []
+    for mode, path, sha1 in read_tree(sha1=tree_sha1):
+        full_path = os.path.join(prefix, path) if prefix else path
+        full_path = full_path.replace('\\', '/')
+        if stat.S_ISDIR(mode):
+            files.extend(read_tree_files(sha1, prefix=full_path))
+        else:
+            files.append((mode, full_path, sha1))
+    return files
+
+
 def find_tree_objects(tree_sha1):
     """Return set of SHA-1 hashes of all objects in this tree (recursively),
     including the hash of the tree itself.
@@ -623,6 +708,10 @@ if __name__ == '__main__':
             help='SHA-1 of commit where the new branch should start (defaults '
                  'to current HEAD)')
 
+    sub_parser = sub_parsers.add_parser('checkout',
+            help='switch to an existing branch')
+    sub_parser.add_argument('branch_name', help='name of branch to switch to')
+
     sub_parser = sub_parsers.add_parser('cat-file',
             help='display contents of object')
     valid_modes = ['commit', 'tree', 'blob', 'size', 'type', 'pretty']
@@ -690,6 +779,12 @@ if __name__ == '__main__':
     elif args.command == 'branch':
         try:
             create_branch(args.name, start_sha1=args.start)
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            sys.exit(1)
+    elif args.command == 'checkout':
+        try:
+            checkout(args.branch_name)
         except ValueError as error:
             print(error, file=sys.stderr)
             sys.exit(1)
