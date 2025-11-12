@@ -143,7 +143,7 @@ def read_index():
     entry_data = data[12:-20]
     entries = []
     i = 0
-    while i + 62 < len(entry_data):
+    while i + 62 <= len(entry_data):
         fields_end = i + 62
         fields = struct.unpack('!LLLLLLLLLL20sH', entry_data[i:fields_end])
         path_end = entry_data.index(b'\x00', fields_end)
