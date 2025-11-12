@@ -40,6 +40,7 @@ def ensure_clean_working_tree():
 
 def init(repo):
     """Create directory for repo and initialize .git directory."""
+    if repo != '.' and not os.path.exists(repo):
     os.mkdir(repo)
     os.mkdir(os.path.join(repo, '.git'))
     for name in ['objects', 'refs', 'refs/heads']:
